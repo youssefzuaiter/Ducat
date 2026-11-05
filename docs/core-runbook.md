@@ -90,6 +90,7 @@ re-checks its own hash chain on every page load.
 | Each evening | Nothing. The Allocator runs by itself; you hear from ntfy only if something needs you. |
 | Quarter-end | A rebalance is proposed. Under $3,000 traded it runs by itself; over that it waits for `core_ctl approve`. |
 | Weekly | `core_ctl status`, or open `/health`: an empty `attention` list is the all-clear. |
+| Whenever you wonder why | `./.venv/bin/python -m swarm.core_allocator --explain` says, in sentences, why the latest close does or does not make a plan (which rule looked, each holding's gap, each leg's reason, whether it needs you). It sends nothing. Every nightly run also writes the same text to `~/Library/Logs/pfw-core-allocator.log` after `why:`. |
 | Monthly | `./.venv/bin/python -m backtest.paper_report --out reports/2026-11.md`. Read *Incidents*; the reading rules are printed at its top. |
 | Daily | Back up `core-state/` (three small files: the journal, the plan state, the kill switch). It is the record the report is built from, and a lost disk loses it. |
 

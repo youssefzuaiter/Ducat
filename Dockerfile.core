@@ -26,7 +26,7 @@ WORKDIR /app
 COPY risk_router/requirements.txt /tmp/requirements.txt
 RUN pip install -r /tmp/requirements.txt && rm /tmp/requirements.txt
 
-COPY config.py outbox.py tier0.py tier0_core.py core_alloc.py core_paper.py webhook.py ./
+COPY config.py outbox.py tier0.py tier0_core.py core_alloc.py core_paper.py core_explain.py webhook.py ./
 COPY risk_router/ risk_router/
 COPY swarm/__init__.py swarm/core_allocator.py swarm/
 COPY policy/core.toml policy/core.toml
