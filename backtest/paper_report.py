@@ -44,6 +44,13 @@ MIN_FILLS_FOR_PLACEMENT: Final[int] = 30
 #: one-way cost, VXUS at the pessimistic level: 8.3 + 5 bp). It is listed as a plumbing fault to look at.
 OUTLIER_BPS: Final[Decimal] = Decimal(25)
 Z95: Final[float] = 1.96
+#: Two kinds of fill (P6). Orders sent before the open fill at the opening print; a rebalance's buys are sent only
+#: after its sells have filled, so they fill minutes into the session.
+PRE_OPEN: Final[str] = "pre-open limit"
+AFTER_SELLS: Final[str] = "after the sells"
+#: P7: how far outside its minute's high-low range a fill may sit and still count as a price that traded. Fixed on
+#: 2026-11-05 before any rebalance fill existed; not tuned to a fill.
+RANGE_TOLERANCE_BPS: Final[Decimal] = Decimal(5)
 TERMINAL_EVENTS: Final[dict[str, str]] = {"plan_done": "done", "plan_abandoned": "abandoned", "plan_expired": "expired",
                                           "plan_deferred": "deferred", "plan_halted": "halted"}
 
@@ -67,7 +74,23 @@ These rules were written on 2026-10-03, before any paper order existed.
   levels are never reported as evidence for or against it. (This is the materiality threshold the registered
   rule R1 lacked, applied only to evidence gathered from now on.)
 * **P5 Nothing here predicts the future.** A few quarters of a policy that rebalances four times a year is a
-  test of the machinery, not of the portfolio's returns. The report does not rank, recommend or judge returns.\
+  test of the machinery, not of the portfolio's returns. The report does not rank, recommend or judge returns.
+
+P6 and P7 were added on 2026-11-05, before any rebalance fill existed (the only fills then were the six pre-open
+buys of the 2026-10-12 build). P1 to P5 are unchanged, and P3 applies to the pre-open group of P6.
+
+* **P6 Two kinds of fill, never pooled.** Orders sent before the open (the initial build's buys, every plan's sells)
+  fill at the opening print, so P3 applies to them as written. A rebalance's buys are sent only after its sells have
+  filled, as marketable limits at the ask plus 0.5%, so they fill minutes into the session, and their distance from
+  the open includes those minutes of market movement, which is not a cost. They are reported separately, as a plain
+  number with that caveat, are never placed among the registered cost levels, and the 25 bp fault rule does not
+  apply to them.
+* **P7 After-sells fills must be prices that traded.** Each is looked up (its order's fill time, then Alpaca's
+  one-minute SIP bar for that minute). Its price must lie inside the bar's low-high range widened by 5 bp each way,
+  a tolerance fixed now, below the 25 bp fault line and not tuned to any fill. A fill outside it is listed as a
+  plumbing fault to look at. A fill that could not be checked (no fill time, no bar, a failed lookup) is counted as
+  unchecked and is never reported as passing. P7 checks that the simulator's fills are prices that existed; it
+  says nothing about what the real market would charge.\
 """
 
 
@@ -101,6 +124,28 @@ class Fill:
     side: str
     qty: Decimal
     price: Decimal
+    client_id: str = ""
+    mode: str = PRE_OPEN                            # P6: PRE_OPEN or AFTER_SELLS
+
+
+@dataclass(frozen=True)
+class MinuteRange:
+    """The high-low range of the one-minute bar an order filled in (P7)."""
+    minute: datetime
+    low: Decimal
+    high: Decimal
+
+
+@dataclass(frozen=True)
+class AfterSellsStats:
+    """A rebalance's buys, placed after its sells (P6, P7). Descriptive: no placement, no fault rule."""
+    n: int
+    unpriced: int                                   # fills with no session open to compare against
+    mean_vs_open_bps: float | None                  # includes the minutes between the open and the fill
+    inside: int                                     # P7: a price that traded
+    outside: list[tuple[Fill, MinuteRange]]         # P7: a plumbing fault
+    unchecked: list[tuple[Fill, str]]               # P7: could not be checked; never counted as passing
+    traded_usd: Decimal
 
 
 @dataclass(frozen=True)
@@ -142,6 +187,7 @@ class Report:
     incidents: list[Incident] = field(default_factory=list)
     counts: Counter[str] = field(default_factory=Counter)
     execution: ExecutionStats | None = None
+    after_sells: AfterSellsStats | None = None
     standing: list[StandRow] | None = None
     cash_share: Decimal | None = None
     standing_session: date | None = None
@@ -196,16 +242,20 @@ def build_incidents(entries: list[dict[str, Any]]) -> list[Incident]:
 
 
 def extract_fills(entries: list[dict[str, Any]]) -> list[Fill]:
-    execute_on = {e["plan_id"]: e["execute_on"] for e in entries if e["event"] == "plan_accepted"}
+    accepted = {e["plan_id"]: e for e in entries if e["event"] == "plan_accepted"}
     fills = []
     for e in entries:
-        if e["event"] not in ("plan_done", "plan_abandoned") or e["plan_id"] not in execute_on:
+        if e["event"] not in ("plan_done", "plan_abandoned") or e["plan_id"] not in accepted:
             continue
-        for o in (e.get("orders") or {}).values():
+        plan = accepted[e["plan_id"]]
+        has_sells = bool((plan.get("plan") or {}).get("sells"))
+        for client_id, o in (e.get("orders") or {}).items():
             qty, price = Decimal(str(o.get("filled_qty") or 0)), Decimal(str(o.get("filled_avg_price") or 0))
             if qty > 0 and price > 0:
-                fills.append(Fill(e["plan_id"], date.fromisoformat(execute_on[e["plan_id"]]), o["symbol"], o["side"],
-                                  qty, price))
+                # Buys wait for the sells only in a plan that has sells; otherwise they go in before the open (P6).
+                mode = AFTER_SELLS if o["side"] == "buy" and has_sells else PRE_OPEN
+                fills.append(Fill(e["plan_id"], date.fromisoformat(plan["execute_on"]), o["symbol"], o["side"],
+                                  qty, price, client_id, mode))
     return fills
 
 
@@ -264,6 +314,32 @@ def analyse_execution(fills: list[Fill], opens: dict[tuple[str, date], Decimal])
                           sum((f.qty * f.price for f in fills), Decimal(0)))
 
 
+def inside_range(price: Decimal, rng: MinuteRange) -> bool:
+    """P7: ``price`` lies in the bar's low-high range widened by the registered tolerance."""
+    tol = RANGE_TOLERANCE_BPS * BPS
+    return rng.low * (1 - tol) <= price <= rng.high * (1 + tol)
+
+
+def analyse_after_sells(fills: list[Fill], opens: dict[tuple[str, date], Decimal],
+                        ranges: dict[str, MinuteRange | str]) -> AfterSellsStats | None:
+    """``ranges`` maps a fill's client order id to its minute's range, or to the reason it could not be read."""
+    if not fills:
+        return None
+    priced = [(f, opens[(f.symbol, f.session)]) for f in fills if (f.symbol, f.session) in opens]
+    values = [float(core_paper.shortfall_bps(f.side, f.price, o, Decimal(0), Decimal(0))["vs_open_bps"]) for f, o in priced]
+    inside, outside, unchecked = 0, [], []
+    for f in fills:
+        got = ranges.get(f.client_id, "no lookup was made")
+        if isinstance(got, str):
+            unchecked.append((f, got))
+        elif inside_range(f.price, got):
+            inside += 1
+        else:
+            outside.append((f, got))
+    return AfterSellsStats(len(fills), len(fills) - len(priced), statistics.fmean(values) if values else None, inside,
+                           outside, unchecked, sum((f.qty * f.price for f in fills), Decimal(0)))
+
+
 # --- where the portfolio stands -----------------------------------------------------------------------------------
 
 def standing(policy: tier0_core.CorePolicy, snap: core_paper.Snapshot) -> tuple[list[StandRow], Decimal]:
@@ -286,7 +362,8 @@ def windowed_fills(entries: list[dict[str, Any]], since: str | None) -> list[Fil
 
 def build_report(entries: list[dict[str, Any]], policy: tier0_core.CorePolicy, *, journal_status: dict[str, Any],
                  opens: dict[tuple[str, date], Decimal] | None = None, snap: core_paper.Snapshot | None = None,
-                 generated: datetime | None = None, since: str | None = None) -> Report:
+                 generated: datetime | None = None, since: str | None = None,
+                 ranges: dict[str, MinuteRange | str] | None = None) -> Report:
     """``entries`` is the whole journal (its integrity covers all of it); ``since`` narrows what is *reported*."""
     report = Report(generated or datetime.now(UTC), policy.sha256, journal_status, entries=len(entries))
     if not journal_status["ok"]:
@@ -305,7 +382,9 @@ def build_report(entries: list[dict[str, Any]], policy: tier0_core.CorePolicy, *
     report.counts = Counter(e["event"] for e in shown)
     report.plans = [p for p in build_plans(entries) if since is None or p.decided_on >= since]
     report.incidents = build_incidents(shown)
-    report.execution = analyse_execution(windowed_fills(entries, since), opens or {})
+    fills = windowed_fills(entries, since)
+    report.execution = analyse_execution([f for f in fills if f.mode == PRE_OPEN], opens or {})
+    report.after_sells = analyse_after_sells([f for f in fills if f.mode == AFTER_SELLS], opens or {}, ranges or {})
     if snap is not None:
         report.standing, report.cash_share = standing(policy, snap)
         report.standing_session = snap.session
@@ -350,10 +429,11 @@ def render(report: Report) -> str:
         else:
             lines += ["No incident: no mismatch, refused order, abandoned or expired plan, breaker block or failing loop.", ""]
     ex = report.execution
-    lines += ["## 3. Execution against the registered cost model (P3, P4)", ""]
+    lines += ["## 3. Execution against the registered cost model (P3, P4, P6)", ""]
     if ex is None:
-        lines += ["No order has filled yet.", ""]
+        lines += ["No order has filled yet." if report.after_sells is None else "No pre-open fill yet.", ""]
     else:
+        lines += ["Fills sent before the open (the build's buys, every plan's sells), which fill at the opening print:", ""]
         lines += [f"- {ex.n} fills with a session open to compare against" + (f", {ex.unpriced} without one" if ex.unpriced else "")
                   + f"; ${ex.traded_usd:,.2f} traded.",
                   f"- Observed cost against the open, paid per side: mean {_bps(ex.mean_bps)}"
@@ -368,6 +448,24 @@ def render(report: Report) -> str:
         if ex.outliers:
             lines += ["Fills more than 25 bp from the open:", ""] + \
                      [f"- {f.session} {f.side} {f.symbol}: {_bps(v)}" for f, v in ex.outliers] + [""]
+    a = report.after_sells
+    if a is not None:
+        lines += ["### Rebalance buys, placed after the sells (P6, P7)", "",
+                  f"- {a.n} fills, ${a.traded_usd:,.2f} traded; mean distance from the open {_bps(a.mean_vs_open_bps)}"
+                  + (f" ({a.unpriced} without a session open)" if a.unpriced else "") + ".",
+                  "- That distance includes the minutes between the open and the fill, which is market movement and not "
+                  "a cost: it is not placed among the registered levels and the 25 bp fault rule does not apply (P6).",
+                  f"- Real prices (P7): {a.inside} of {a.n} lie inside their fill minute's range (widened by "
+                  f"{RANGE_TOLERANCE_BPS:.0f} bp)"
+                  + (f", {len(a.outside)} outside" if a.outside else "")
+                  + (f", {len(a.unchecked)} could not be checked" if a.unchecked else "") + ".", ""]
+        if a.outside:
+            lines += ["Fills outside their minute's range, a plumbing fault to look at:", ""] + \
+                     [f"- {f.session} {f.symbol} filled at {f.price}; {r.minute:%H:%M} UTC range {r.low} to {r.high}"
+                      for f, r in a.outside] + [""]
+        if a.unchecked:
+            lines += ["Not checked (never counted as passing):", ""] + \
+                     [f"- {f.session} {f.symbol}: {why}" for f, why in a.unchecked] + [""]
     lines += ["## 4. Where the portfolio stands", ""]
     if report.standing is None:
         lines += ["Not read (offline, or Alpaca unavailable).", ""]
@@ -399,6 +497,37 @@ async def fetch_opens(broker: Any, fills: list[Fill]) -> dict[tuple[str, date], 
     return opens
 
 
+def _instant(stamp: Any) -> datetime:
+    return datetime.fromisoformat(str(stamp).replace("Z", "+00:00")).astimezone(UTC)
+
+
+async def fetch_minute_ranges(broker: Any, fills: list[Fill]) -> dict[str, MinuteRange | str]:
+    """P7: for each after-sells fill, the high-low range of the one-minute bar its order filled in. A fill whose
+    range cannot be read maps to the reason, so it is reported as unchecked and can never pass by default."""
+    out: dict[str, MinuteRange | str] = {}
+    for f in fills:
+        if f.mode != AFTER_SELLS:
+            continue
+        try:
+            order = await broker.order_by_client_id(f.client_id)
+            if order is None:
+                out[f.client_id] = "the order was not found at Alpaca"
+                continue
+            if not order.get("filled_at"):
+                out[f.client_id] = "the order has no fill time"
+                continue
+            minute = _instant(order["filled_at"]).replace(second=0, microsecond=0)
+            bars = await broker.minute_bars(f.symbol, minute.isoformat(), (minute + timedelta(minutes=1)).isoformat())
+            bar = next((b for b in bars if _instant(b["t"]) == minute), None)
+            if bar is None:
+                out[f.client_id] = f"no one-minute bar for {minute:%H:%M} UTC"
+                continue
+            out[f.client_id] = MinuteRange(minute, Decimal(str(bar["l"])), Decimal(str(bar["h"])))
+        except Exception as exc:  # noqa: BLE001 - one unreadable lookup must not take the report down, nor pass
+            out[f.client_id] = f"could not be read: {type(exc).__name__}"
+    return out
+
+
 async def main_async(args: argparse.Namespace) -> int:
     policy = tier0_core.load_policy(Path(os.getenv("CORE_POLICY_PATH", str(DEFAULT_POLICY))))
     state_dir = Path(args.state_dir)
@@ -409,13 +538,16 @@ async def main_async(args: argparse.Namespace) -> int:
     status = Journal(journal_path, CoreStore(state_dir / "core-plan-state.json"), policy.sha256).status(repair=False)
     entries = parse_entries(journal_path.read_text(encoding="utf-8"))
     opens: dict[tuple[str, date], Decimal] = {}
+    ranges: dict[str, MinuteRange | str] = {}
     snap = None
     key, secret = os.getenv("CORE_ALPACA_KEY_ID", "").strip(), os.getenv("CORE_ALPACA_SECRET_KEY", "").strip()
     if status["ok"] and not args.offline and key and secret:
         from risk_router.alpaca_async import AlpacaError, AsyncAlpaca
         alpaca = AsyncAlpaca(key, secret)
         try:
-            opens = await fetch_opens(alpaca, windowed_fills(entries, args.since))
+            shown_fills = windowed_fills(entries, args.since)
+            opens = await fetch_opens(alpaca, shown_fills)
+            ranges = await fetch_minute_ranges(alpaca, shown_fills)
             today = datetime.now(UTC).date()
             days = sorted(date.fromisoformat(s["date"]) for s in await alpaca.calendar(
                 (today - timedelta(days=14)).isoformat(), today.isoformat()))
@@ -426,7 +558,8 @@ async def main_async(args: argparse.Namespace) -> int:
             print(f"(Alpaca could not be read: {exc}; the report covers the journal only)", file=sys.stderr)
         finally:
             await alpaca.aclose()
-    text = render(build_report(entries, policy, journal_status=status, opens=opens, snap=snap, since=args.since))
+    text = render(build_report(entries, policy, journal_status=status, opens=opens, snap=snap, since=args.since,
+                                ranges=ranges))
     if args.out:
         Path(args.out).write_text(text + "\n", encoding="utf-8")
         print(f"written to {args.out}")
