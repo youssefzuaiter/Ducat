@@ -12,6 +12,10 @@ Run it once per session, after 16:20 New York, e.g. a Kubernetes CronJob::
 
     python -m swarm.core_allocator               # today's session
     python -m swarm.core_allocator --session 2026-10-05
+    python -m swarm.core_allocator --explain     # why the latest close does, or does not, make a plan; sends nothing
+
+Every run also writes the reasoning to its log (``why: ...``), so each night's decision, and each night's no-plan,
+can be read afterwards.
 """
 
 from __future__ import annotations
@@ -23,7 +27,7 @@ import logging
 import os
 import sys
 import time
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from typing import Any, Final
@@ -31,6 +35,7 @@ from zoneinfo import ZoneInfo
 
 import httpx
 
+import core_explain
 import core_paper
 import tier0_core
 import webhook
@@ -48,15 +53,32 @@ def signed_headers(body: bytes, secret: str) -> dict[str, str]:
             "Content-Type": "application/json"}
 
 
+def explanation(policy: tier0_core.CorePolicy, snap: core_paper.Snapshot, plan: Any) -> list[str]:
+    """Why this decision, in sentences (``core_explain``). Never raises: an explanation is a convenience, and a bug in
+    it must not stop a proposal."""
+    try:
+        return core_explain.explain(policy, snap, plan)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("could not explain the decision: %s: %s", type(exc).__name__, exc)
+        return []
+
+
 async def propose(alpaca: Any, http: httpx.AsyncClient, policy: tier0_core.CorePolicy, session: date,
-                  secret: str) -> dict[str, Any]:
-    """One decision for ``session``; returns the router's answer."""
+                  secret: str, *, explain_only: bool = False) -> dict[str, Any]:
+    """One decision for ``session``; returns the router's answer. With ``explain_only`` nothing is sent: it
+    reads, decides and explains."""
     state = await http.get("/v1/core/state", headers=signed_headers(b"", secret))
     state.raise_for_status()
     facts = state.json()
     snap = await core_paper.read_snapshot(alpaca, policy, session, forced=bool(facts["forced"]),
                                           targets={s: Decimal(w) for s, w in facts["targets"].items()})
     plan = core_paper.decide(policy, snap)
+    why = explanation(policy, snap, plan)
+    if why and not explain_only:        # --explain prints it instead
+        logger.info("why: %s", "\n".join(why))
+    if explain_only:
+        return {"http_status": 200, "explained": True, "plan": core_paper.plan_to_json(plan) if plan else None,
+                "why": why}
     body = json.dumps({"session": session.isoformat(), "inputs": snap.digest(),
                        "plan": core_paper.plan_to_json(plan) if plan else None}, sort_keys=True).encode()
     response = await http.post("/v1/core/plans", content=body, headers=signed_headers(body, secret))
@@ -73,19 +95,33 @@ def default_session(now: datetime) -> date:
 
 
 async def run(alpaca: Any, http: httpx.AsyncClient, policy: tier0_core.CorePolicy, session: date,
-              secret: str) -> int:
+              secret: str, *, explain_only: bool = False) -> int:
     """Decide and propose one session; the process's exit status. A weekend or a holiday is not an error, so a
     daily schedule can simply run this every day."""
     days = await alpaca.calendar(session.isoformat(), session.isoformat())
     if not any(date.fromisoformat(d["date"]) == session for d in days):
         print(json.dumps({"status": "skipped", "reason": f"{session} is not a trading session"}))
         return 0
-    answer = await propose(alpaca, http, policy, session, secret)
+    answer = await propose(alpaca, http, policy, session, secret, explain_only=explain_only)
+    if explain_only:
+        print("\n".join(answer["why"]) or "(no explanation)")
+        return 0
     print(json.dumps(answer, indent=1, default=str))
     return 0 if answer["http_status"] == 200 else 1
 
 
-async def main_async(session: date | None) -> int:
+async def last_session(alpaca: Any, now: datetime) -> date:
+    """The latest close a decision can use right now (for ``--explain``, which may run before 16:20)."""
+    today = now.astimezone(NEW_YORK).date()
+    days = [date.fromisoformat(d["date"]) for d in await alpaca.calendar((today - timedelta(days=10)).isoformat(),
+                                                                          today.isoformat())]
+    last = core_paper.last_published(days, now)
+    if last is None:
+        raise SystemExit("no session close has been published in the last ten days")
+    return last
+
+
+async def main_async(session: date | None, explain_only: bool = False) -> int:
     policy = tier0_core.load_policy(Path(os.getenv("CORE_POLICY_PATH", str(DEFAULT_POLICY))))
     problems = tier0_core.violations(policy)
     if problems:
@@ -96,7 +132,9 @@ async def main_async(session: date | None) -> int:
     alpaca = AsyncAlpaca(os.environ["CORE_ALPACA_KEY_ID"], os.environ["CORE_ALPACA_SECRET_KEY"])
     try:
         async with httpx.AsyncClient(base_url=router_url, timeout=60.0) as http:
-            return await run(alpaca, http, policy, session or default_session(datetime.now(UTC)), secret)
+            now = datetime.now(UTC)
+            chosen = session or (await last_session(alpaca, now) if explain_only else default_session(now))
+            return await run(alpaca, http, policy, chosen, secret, explain_only=explain_only)
     except httpx.HTTPError as exc:
         # The router is down or unreachable: nothing was proposed. The schedule's next attempt can still make
         # the 09:20 window if it comes before the next morning; say plainly what failed.
@@ -110,7 +148,10 @@ def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)-7s %(name)s: %(message)s")
     parser = argparse.ArgumentParser(prog="python -m swarm.core_allocator", description=__doc__.split("\n\n")[0])
     parser.add_argument("--session", type=date.fromisoformat, default=None)
-    return asyncio.run(main_async(parser.parse_args(argv).session))
+    parser.add_argument("--explain", action="store_true",
+                        help="read, decide and say why, for the latest published close; propose nothing")
+    args = parser.parse_args(argv)
+    return asyncio.run(main_async(args.session, args.explain))
 
 
 if __name__ == "__main__":
