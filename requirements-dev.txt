@@ -11,6 +11,8 @@ scikit-learn==1.9.1
 # The backtester's point-in-time store and Parquet cache (backtest/, design D10).
 # Research only: no service image imports it.
 duckdb>=1.1
+# duckdb 2.x imports pytz when it converts timestamps and no longer installs it (CI failed on this on 2026-11-05).
+pytz
 
 # Linting in CI (.github/workflows/ci.yml): `ruff check --select F,E9 .`
 ruff>=0.6
