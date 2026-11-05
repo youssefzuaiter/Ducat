@@ -100,6 +100,7 @@ re-checks its own hash chain on every page load.
 | **A plan needs your approval** | The initial build, a plan over $3,000, or a raise-cash plan. | `core_ctl approve` (it shows the orders first). Before 09:27 New York on the execution day, or it expires and is re-decided that evening. |
 | **A rebalance was abandoned part-way** | The router died, or an order never settled, between the sells and the buys. It cancelled what was left. | Nothing: the next close re-decides it from the real positions. If it repeats, find out why the host was down. |
 | **A plan missed its session** | Not approved in time, or the router was down 09:20–09:27. | Nothing: re-decided at that evening's close, one day late. |
+| **The router is not answering** (the watchdog) | The process died or the Mac slept: the router cannot alert about its own absence, so a separate check does (below). On 2026-10-05 this went unnoticed for a day. | `launchctl kickstart -k gui/$(id -u)/com.pfw.core-router`, then read `~/Library/Logs/pfw-core-router.log`. Before 09:27 New York on a plan day, or the plan expires. |
 | **The breaker deferred a plan / the buys were blocked after the open** | The account was down ≥ 2.5% on the day. | Nothing. Sells may have executed; no exposure was added; the close re-decides. (The breaker cannot see a gap before the open, so this can only show up after the sells fill. The backtest defers the whole plan; paper cannot.) |
 | **Alpaca refused an order** | A 4xx: insufficient quantity, a halted symbol, a rule. The rest of the plan carried on. | Read the `error` in the journal. One-off: ignore. Repeated: investigate. |
 | **Sells/buys did not fill in time** | The limit collar (3%) was not reached on a big gap, or Alpaca was slow. | Nothing: the remainder is re-decided at the close. |
@@ -108,6 +109,15 @@ re-checks its own hash chain on every page load.
 | **The execution loop keeps failing** | Three ticks in a row (45 s) failed; repeats hourly. | Check Alpaca's status and the host's log. Orders are at-most-once by client id, so retries are safe. |
 | **The website mirror has not updated for 30 minutes** | `GET /health` lists it under `attention`; `pfw_sync.last_error` says why. `HTTP 403`: `WEBHOOK_SECRET` differs between here and PFW. `HTTP 503 paper_trading_user_unresolved`: PFW's `PAPER_TRADING_USER_EMAIL` matches no user. `HTTP 503 core_mirror_unavailable`: PFW's `core_agent_mirror` migration has not been applied. `HTTP 404`: PFW has not deployed the route yet. `chain_conflict`: PFW holds a different history for an entry (the journal was restored from an older copy, or PFW's data was changed). | Trading is unaffected, and nothing is lost: the journal is the outbox. Fix the cause and it catches up by itself. For `chain_conflict`, compare `core-state/core-journal.jsonl` with the website's journal before changing anything. |
 | **The journal failed its integrity check** | An entry was altered, removed, or the files are from different times. **Trading is disabled until this is resolved.** | **Do not delete anything.** Copy `core-state/` aside, compare with your backup, and see whether the damage is the last entry (a restore fixes it) or the middle (investigate). |
+
+**The watchdog.** `com.pfw.core-watchdog` (launchd, weekdays 16:00 Istanbul, which is 08:00 New York in winter and
+09:00 in summer, before the window either way) runs `python -m risk_router.core_watchdog`. It reads `/health` and is
+silent on an ordinary healthy day. It speaks, as a macOS notification and through `CORE_ALERT_WEBHOOK_URL` when set,
+if the router does not answer, is halted or disabled, has stopped ticking or fails its journal check, and on a plan
+day if the Mac is on battery (`caffeinate -s` only holds off sleep on AC), if the plan still waits for your approval,
+or, once, to say a plan executes today and everything is fine. It is read-only and cannot trade. It cannot run if the
+Mac is asleep at 16:00: it is a check on the router, not on the Mac. In winter the window is 17:20-17:27 Istanbul,
+in summer 16:20-16:27.
 
 **The kill switch:** `core_ctl halt` stops all core trading and cancels open orders. It survives restarts. To resume,
 delete `core-router-state.json` in the state directory on the router's host and restart it.
