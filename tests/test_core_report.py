@@ -70,10 +70,11 @@ async def test_the_report_reads_a_journal_the_real_router_wrote(tmp_path: Path) 
     assert [(p.kind, p.outcome) for p in report.plans] == [("initial", "done"), ("rebalance", "done")]
     assert all(p.filled == p.orders > 0 for p in report.plans)
     assert report.incidents == []
-    ex = report.execution
-    assert ex is not None and ex.n == len(fills) > 6 and ex.unpriced == 0
+    ex = report.execution       # P6: only the fills sent before the open (the build's six buys and the sell)
+    assert ex is not None and ex.n == 7 and ex.unpriced == 0
+    assert report.after_sells is not None and report.after_sells.n == len(fills) - ex.n == 5   # the rebalance's buys
     assert ex.mean_bps == pytest.approx(3.0, abs=1e-6)
-    assert ex.by_side["buy"][1] == pytest.approx(3.0, abs=1e-6) and ex.by_side["sell"][1] == pytest.approx(3.0, abs=1e-6)
+    assert ex.by_side["buy"] == (6, pytest.approx(3.0, abs=1e-6)) and ex.by_side["sell"][1] == pytest.approx(3.0, abs=1e-6)
     assert "too few" in ex.placement
     text = pr.render(report)
     assert "Reading rules" in text and "No incident" in text and "too few to say" in text

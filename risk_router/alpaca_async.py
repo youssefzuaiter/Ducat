@@ -178,6 +178,15 @@ class AsyncAlpaca:
                 return out
             params["page_token"] = token
 
+    async def minute_bars(self, symbol: str, start: str, end: str) -> list[dict[str, Any]]:
+        """One symbol's one-minute SIP bars between two RFC 3339 instants, oldest first; ``t`` is the minute's
+        start. For a minute or two, so one page. Read-only: the paper report uses it to check that a fill is a
+        price that traded."""
+        params: dict[str, Any] = {"symbols": symbol, "timeframe": "1Min", "start": start, "end": end,
+                                  "adjustment": "raw", "feed": "sip", "limit": 10_000, "sort": "asc"}
+        body = await self._get(self._data, "/v2/stocks/bars", params)
+        return list((body.get("bars") or {}).get(symbol, []))
+
     async def calendar(self, start: str, end: str) -> list[dict[str, Any]]:
         """Exchange sessions (New York wall clock), from the paper trading host. Read-only."""
         return await self._get(self._trading, "/v2/calendar", {"start": start, "end": end})
