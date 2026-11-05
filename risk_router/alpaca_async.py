@@ -161,11 +161,13 @@ class AsyncAlpaca:
             )
         return response.json(parse_float=Decimal)
 
-    async def daily_bars(self, symbols: list[str], start: str, end: str) -> dict[str, list[dict[str, Any]]]:
-        """Raw (unadjusted) daily SIP bars per symbol, oldest first: the prices that actually traded.
-        Read-only; the long-term core's Allocator and router value positions with them."""
+    async def daily_bars(self, symbols: list[str], start: str, end: str, *,
+                         adjustment: str = "raw") -> dict[str, list[dict[str, Any]]]:
+        """Daily SIP bars per symbol, oldest first. Raw (unadjusted) by default: the prices that actually traded,
+        which the long-term core's Allocator and router value positions with. ``adjustment="all"`` gives the
+        total-return series (splits and dividends) the shadow portfolios compare mixes on. Read-only."""
         params: dict[str, Any] = {"symbols": ",".join(symbols), "timeframe": "1Day", "start": start, "end": end,
-                                  "adjustment": "raw", "feed": "sip", "limit": 10_000, "sort": "asc"}
+                                  "adjustment": adjustment, "feed": "sip", "limit": 10_000, "sort": "asc"}
         out: dict[str, list[dict[str, Any]]] = {s: [] for s in symbols}
         while True:
             body = await self._get(self._data, "/v2/stocks/bars", params)
