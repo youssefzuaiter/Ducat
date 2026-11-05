@@ -13,3 +13,6 @@ state/
 # hash-chained journal of everything it did. It is the record, not source: it lives on the host's volume and
 # is backed up from there, never committed.
 core-state/
+
+# The shadow portfolios' derived series (backtest/shadow.py): recomputed from published bars on every run.
+shadow-state/
